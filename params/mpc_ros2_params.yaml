@@ -21,7 +21,7 @@
     acc_lim_theta: 3.0
     acc_lim_y: 0.0
 
-  # Goal Tolerance Parametes
+  # Goal Tolerance Parameters
     yaw_goal_tolerance: 1.0
     xy_goal_tolerance: 0.5
     latch_xy_goal_tolerance: false

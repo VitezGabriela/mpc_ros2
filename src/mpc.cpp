@@ -31,6 +31,7 @@ public:
     std::vector<double> w_joints_;        // weights for 9 joints
     double w_control_;
     double w_control_change_;
+    double w_terminal_;
 
     int joint_start_;
     int joint_rate_start_;
@@ -47,6 +48,7 @@ public:
 
         w_control_ = 1.0;
         w_control_change_ = 1.0;
+        w_terminal_ = 100;
 
         joint_start_ = 0;
         joint_rate_start_ = 9 * mpc_horizon_;
@@ -89,6 +91,12 @@ public:
             }
         }
 
+        // Terminal cost
+        for (size_t j = 0; j < 9; j++)
+        {
+            fg[0] += w_terminal_ * CppAD::pow(vars[joint_start_ + (mpc_horizon_ - 1) * 9 + j] - ref_joints_[j], 2);
+        }
+        
         // --- Initial constraints (initial state equals first vars) ---
         for (size_t j = 0; j < 9; j++)
         {

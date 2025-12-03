@@ -22,7 +22,7 @@ using namespace std::chrono_literals;
 namespace MpcRos
 {
 
-class MPCRosNode : public rclcpp::Node, public std::enable_shared_from_this<MPCRosNode>
+class MPCRosNode : public rclcpp::Node
 {
 public:
     MPCRosNode(const std::string & nodeName, const rclcpp::NodeOptions & options);
@@ -56,7 +56,7 @@ private:
     std::string headPitchJointName_;
 
     // MPC and MoveIt
-    moveit::planning_interface::MoveGroupInterface move_group_;
+    std::unique_ptr<moveit::planning_interface::MoveGroupInterface> move_group_;
     std::unique_ptr<MPC> mpc_;
 };
 
@@ -93,11 +93,6 @@ MPCRosNode::MPCRosNode(const std::string & nodeName, const rclcpp::NodeOptions &
 
     // MPC
     mpc_ = std::make_unique<MPC>();
-
-    move_group_ = std::make_unique<moveit::planning_interface::MoveGroupInterface>(
-    this->shared_from_this(), 
-    "right_arm_with_vacuum"
-);
 }
 
 void MPCRosNode::goalCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg)
@@ -129,11 +124,18 @@ void MPCRosNode::calculateControl()
     if (!goal_received_) return;
 
     // Get current robot state
-    moveit::core::RobotStatePtr kinematic_state = move_group_.getCurrentState();
+    if (!move_group_) {
+        move_group_ = std::make_unique<moveit::planning_interface::MoveGroupInterface>(
+            this->shared_from_this(),
+            "right_arm_with_vacuum"
+        );
+    }
+
+    moveit::core::RobotStatePtr kinematic_state = move_group_->getCurrentState();
     const moveit::core::JointModelGroup* joint_group = kinematic_state->getJointModelGroup("vacuum_and_right_arm");
 
     geometry_msgs::msg::PoseStamped goal_pose;
-    goal_pose.header.frame_id = move_group.getPlanningFrame(); 
+    goal_pose.header.frame_id = move_group_->getPlanningFrame(); 
     goal_pose.pose.position.x = goal_pos_.x();
     goal_pose.pose.position.y = goal_pos_.y();
     goal_pose.pose.position.z = goal_pos_.z();              
@@ -181,6 +183,7 @@ void MPCRosNode::calculateControl()
         state[i + 2] = right_arm_pos_[i]; 
 
     // Solve MPC
+    auto [traj, controls] = mpc_->solve(state);
     if (traj.size() < 2) return;
 
     // --- Next predicted positions ---

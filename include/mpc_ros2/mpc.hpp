@@ -42,14 +42,14 @@ class MPC
   public:
     MPC();
     MPC(const std::map<std::string, double> &params);
-    std::tuple<std::vector<std::tuple<double, double>>, std::vector<double>>
-     solve(Eigen::VectorXd state, Eigen::VectorXd coeffs);
-    
+    std::tuple<std::vector<std::vector<double>>, std::vector<double>> solve(const Eigen::VectorXd& state);
+    void set_references(double j0, double j1, double j2, double j3, double j4,
+                        double j5, double j6, double j7, double j8);
   private:
-    double _maxAngvel, _maxAccel, _boundValue;
-    size_t _mpcStepsize, _xStart, _yStart, _thetaStart, _vStart,
-     _cteStart, _eThetaStart, _angvelStart, _accelStart;
-    std::map<std::string, double> _mpcParams_;
+    int mpc_horizon_;
+    double max_rate_;   
+    double bound_value_;
+    std::vector<double> _references; 
 };
 } // namespace MpcRos
 #endif

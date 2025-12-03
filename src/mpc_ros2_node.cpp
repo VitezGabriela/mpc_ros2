@@ -43,8 +43,8 @@ private:
 
     // Robot state
     Eigen::VectorXd right_arm_pos_; // 7 DOF
-    double head_yaw_;
-    double head_pitch_;
+    double vacuum_head_yaw_;
+    double vacuum_head_pitch_;
 
     // Goal
     Eigen::Vector3d goal_pos_;
@@ -62,14 +62,14 @@ private:
 MPCRosNode::MPCRosNode(const std::string & nodeName, const rclcpp::NodeOptions & options)
 : Node(nodeName, options),
   right_arm_pos_(Eigen::VectorXd::Zero(7)),
-  head_yaw_(0.0), head_pitch_(0.0),
+  vacuum_head_yaw_(0.0), vacuum_head_pitch_(0.0),
   goal_pos_(Eigen::Vector3d::Zero()), goal_received_(false)
 {
     // Parameters
-    this->declare_parameter<std::string>("head_yaw_joint", "vacuum_body_to_stick_root");
-    this->declare_parameter<std::string>("head_pitch_joint", "vacuum_stick_root_to_head");
-    this->get_parameter("head_yaw_joint", headYawJointName_);
-    this->get_parameter("head_pitch_joint", headPitchJointName_);
+    this->declare_parameter<std::string>("vacuum_head_yaw_joint", "vacuum_body_to_stick_root");
+    this->declare_parameter<std::string>("vacuum_head_pitch_joint", "vacuum_stick_root_to_head");
+    this->get_parameter("vacuum_head_yaw_joint", headYawJointName_);
+    this->get_parameter("vacuum_head_pitch_joint", headPitchJointName_);
 
     rightArmJointNames_ = {
         "right_shoulder_y", "right_shoulder_x", "right_shoulder_z",
@@ -105,8 +105,8 @@ void MPCRosNode::jointStateCallback(const sensor_msgs::msg::JointState::SharedPt
     for (size_t i = 0; i < msg->name.size(); ++i)
     {
         const auto &n = msg->name[i];
-        if (n == headYawJointName_) head_yaw_ = msg->position[i];
-        else if (n == headPitchJointName_) head_pitch_ = msg->position[i]; // passive
+        if (n == headYawJointName_) vacuum_head_yaw_ = msg->position[i];
+        else if (n == headPitchJointName_) vacuum_head_pitch_ = msg->position[i]; // passive
         else
         {
             for (size_t j = 0; j < rightArmJointNames_.size(); ++j)
@@ -122,15 +122,18 @@ void MPCRosNode::calculateControl()
 {
     if (!goal_received_) return;
 
-    moveit::planning_interface::MoveGroupInterface group(this, "vacuum_and_right_arm");
+    auto self = this->shared_from_this();
+    moveit::planning_interface::MoveGroupInterface move_group(self, "vacuum_and_right_arm");
 
     // Get current robot state
-    moveit::core::RobotStatePtr kinematic_state = group.getCurrentState();
+    moveit::core::RobotStatePtr kinematic_state = move_group.getCurrentState();
     const moveit::core::JointModelGroup* joint_group = kinematic_state->getJointModelGroup("vacuum_and_right_arm");
 
     geometry_msgs::msg::PoseStamped goal_pose;
-    goal_pose.header.frame_id = group.getPlanningFrame(); 
-    goal_pose.pose.position = goal_pos_;                  
+    goal_pose.header.frame_id = move_group.getPlanningFrame(); 
+    goal_pose.pose.position.x = goal_pos_.x();
+    goal_pose.pose.position.y = goal_pos_.y();
+    goal_pose.pose.position.z = goal_pos_.z();              
     goal_pose.pose.orientation.w = 1.0;              
 
     bool ik_found = kinematic_state->setFromIK(joint_group, goal_pose.pose);
@@ -151,7 +154,7 @@ void MPCRosNode::calculateControl()
     }
 
     // --- Push references into MPC ---
-    // Here, order: [vacuum_yaw, vacuum_pitch, right_shoulder_y, right_shoulder_x, right_shoulder_z, right_elbow_y, right_wrist_z, right_wrist_x, right_wrist_y]
+    // Here, order: [vacuum_head_yaw, vacuum_head_pitch, right_shoulder_y, right_shoulder_x, right_shoulder_z, right_elbow_y, right_wrist_z, right_wrist_x, right_wrist_y]
     _mpc->set_references(
         joint_references[0], // vacuum yaw
         joint_references[1], // vacuum pitch
@@ -167,8 +170,8 @@ void MPCRosNode::calculateControl()
     Eigen::VectorXd state(9);
 
     // vacuum joints
-    state[0] = head_yaw_;      // vacuum yaw
-    state[1] = vacuum_pitch_;  // vacuum pitch
+    state[0] = vacuum_head_yaw_;      // vacuum yaw
+    state[1] = vacuum_head_pitch_;  // vacuum pitch
 
     // right arm joints
     for (size_t i = 0; i < 7; ++i)

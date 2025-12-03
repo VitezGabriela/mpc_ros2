@@ -123,7 +123,6 @@ void MPCRosNode::calculateControl()
 {
     if (!goal_received_) return;
 
-    // Get current robot state
     if (!move_group_) {
         move_group_ = std::make_unique<moveit::planning_interface::MoveGroupInterface>(
             this->shared_from_this(),
@@ -135,11 +134,11 @@ void MPCRosNode::calculateControl()
     const moveit::core::JointModelGroup* joint_group = kinematic_state->getJointModelGroup("vacuum_and_right_arm");
 
     geometry_msgs::msg::PoseStamped goal_pose;
-    goal_pose.header.frame_id = move_group_->getPlanningFrame(); 
+    goal_pose.header.frame_id = move_group_->getPlanningFrame();
     goal_pose.pose.position.x = goal_pos_.x();
     goal_pose.pose.position.y = goal_pos_.y();
-    goal_pose.pose.position.z = goal_pos_.z();              
-    goal_pose.pose.orientation.w = 1.0;              
+    goal_pose.pose.position.z = goal_pos_.z();
+    goal_pose.pose.orientation.w = 1.0;
 
     bool ik_found = kinematic_state->setFromIK(joint_group, goal_pose.pose);
     if (!ik_found)
@@ -152,14 +151,13 @@ void MPCRosNode::calculateControl()
     std::vector<double> joint_references;
     kinematic_state->copyJointGroupPositions(joint_group, joint_references);
 
-    if (joint_references.size() != 9) 
+    if (joint_references.size() != 9)
     {
         RCLCPP_WARN(this->get_logger(), "Unexpected number of joints from MoveIt IK");
         return;
     }
 
-    // --- Push references into MPC ---
-    // Here, order: [vacuum_head_yaw, vacuum_head_pitch, right_shoulder_y, right_shoulder_x, right_shoulder_z, right_elbow_y, right_wrist_z, right_wrist_x, right_wrist_y]
+    // Push references into MPC (order must match)
     mpc_->set_references(
         joint_references[0], // vacuum yaw
         joint_references[1], // vacuum pitch
@@ -175,19 +173,19 @@ void MPCRosNode::calculateControl()
     Eigen::VectorXd state(9);
 
     // vacuum joints
-    state[0] = vacuum_head_yaw_;      // vacuum yaw
-    state[1] = vacuum_head_pitch_;  // vacuum pitch
+    state[0] = vacuum_head_yaw_;
+    state[1] = vacuum_head_pitch_;
 
     // right arm joints
     for (size_t i = 0; i < 7; ++i)
-        state[i + 2] = right_arm_pos_[i]; 
+        state[i + 2] = right_arm_pos_[i];
 
     // Solve MPC
     auto [traj, controls] = mpc_->solve(state);
     if (traj.size() < 2) return;
 
-    // --- Next predicted positions ---
-    std::vector<double> next_positions = traj[1]; 
+    // Next predicted positions
+    std::vector<double> next_positions = traj[1];
 
     // --- Publish vacuum joints ---
     sensor_msgs::msg::JointState vacuum_cmd;
@@ -208,7 +206,6 @@ void MPCRosNode::calculateControl()
         next_positions[5], next_positions[6], next_positions[7], next_positions[8]
     };
     pubRightArmCmds_->publish(right_cmd);
-
 }
 
 } // namespace MpcRos

@@ -50,6 +50,8 @@ class MPC
     double max_rate_;   
     double bound_value_;
     std::vector<double> _references; 
+    std::vector<double> last_controls_;
+
 };
 } // namespace MpcRos
 #endif

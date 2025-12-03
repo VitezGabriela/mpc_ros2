@@ -4,7 +4,8 @@
  * Author: Mustafa Ege Kural (original)
  * Adaptation: Gabriela Vitez
  */
-#include <cstddef>     
+
+#include <cstddef>
 #include <vector>
 #include <tuple>
 #include <cppad/cppad.hpp>
@@ -12,12 +13,13 @@
 #include <Eigen/Dense>
 
 #include "mpc_ros2/mpc.hpp"
+
 namespace MpcRos
 {
 
 /**
  * @brief FG_eval class for MPC
- * 
+ *
  * State vector: [joint1..joint9]
  * Control vector: [joint1_rate..joint9_rate]
  */
@@ -48,7 +50,7 @@ public:
 
         w_control_ = 1.0;
         w_control_change_ = 1.0;
-        w_terminal_ = 100;
+        w_terminal_ = 100.0;
 
         joint_start_ = 0;
         joint_rate_start_ = 9 * mpc_horizon_;
@@ -56,7 +58,7 @@ public:
 
     void set_references(const std::vector<double>& refs)
     {
-        ref_joints_ = refs;
+        if (refs.size() == 9) ref_joints_ = refs;
     }
 
     void operator()(ADvector& fg, const ADvector& vars)
@@ -64,7 +66,7 @@ public:
         // fg[0] is cost
         fg[0] = 0;
 
-        // --- State tracking cost ---
+        // --- State tracking cost (for every timestep) ---
         for (int i = 0; i < mpc_horizon_; i++)
         {
             for (size_t j = 0; j < 9; j++)
@@ -73,7 +75,8 @@ public:
             }
         }
 
-        // --- Control effort cost ---
+        // --- Control effort cost (for every control except maybe last) ---
+        // Note: we have (mpc_horizon_ - 1) control steps in this formulation
         for (int i = 0; i < mpc_horizon_ - 1; i++)
         {
             for (size_t j = 0; j < 9; j++)
@@ -82,25 +85,26 @@ public:
             }
         }
 
-        // --- Control change cost ---
+        // --- Control change cost (smoothness) ---
         for (int i = 0; i < mpc_horizon_ - 2; i++)
         {
             for (size_t j = 0; j < 9; j++)
             {
-                fg[0] += w_control_change_ * CppAD::pow(vars[joint_rate_start_ + (i+1) * 9 + j] - vars[joint_rate_start_ + i * 9 + j], 2);
+                fg[0] += w_control_change_ * CppAD::pow(
+                    vars[joint_rate_start_ + (i+1) * 9 + j] - vars[joint_rate_start_ + i * 9 + j], 2);
             }
         }
 
-        // Terminal cost
+        // --- Terminal cost on final state (x_{N-1}) ---
         for (size_t j = 0; j < 9; j++)
         {
             fg[0] += w_terminal_ * CppAD::pow(vars[joint_start_ + (mpc_horizon_ - 1) * 9 + j] - ref_joints_[j], 2);
         }
-        
-        // --- Initial constraints (initial state equals first vars) ---
+
+        // --- Initial constraints: initial state equals first vars (x0) ---
         for (size_t j = 0; j < 9; j++)
         {
-            fg[1 + j] = vars[j]; // first timestep
+            fg[1 + j] = vars[joint_start_ + j]; // x0_j
         }
 
         // --- Dynamics constraints---
@@ -120,17 +124,22 @@ public:
 
 /**
  * @brief MPC solver class for 9 joints
+ *
+ * Implementation includes persistent last_controls_ for warm-starting.
  */
- MPC::MPC()
+
+MPC::MPC()
 {
     mpc_horizon_ = 20;
     max_rate_ = 1.0;
     bound_value_ = 1.0e3;
 
     _references.resize(9, 0.0);
+
+    last_controls_.assign(9, 0.0);
 }
 
- void MPC::set_references(double j0, double j1, double j2, double j3, double j4, double j5, double j6, double j7, double j8)
+void MPC::set_references(double j0, double j1, double j2, double j3, double j4, double j5, double j6, double j7, double j8)
 {
     _references = {j0, j1, j2, j3, j4, j5, j6, j7, j8};
 }
@@ -149,7 +158,7 @@ std::tuple<std::vector<std::vector<double>>, std::vector<double>> MPC::solve(con
     Dvector constraints_lowerbound(nConstraints);
     Dvector constraints_upperbound(nConstraints);
 
-    // --- Initialize decision variables ---
+    // --- Initialize decision variables (initial guess) ---
     for (size_t i = 0; i < nVars; i++) vars[i] = 0.0;
 
     // --- Variable bounds ---
@@ -167,18 +176,31 @@ std::tuple<std::vector<std::vector<double>>, std::vector<double>> MPC::solve(con
         }
     }
 
-    // --- Constraints ---
+    // --- Constraints initialization ---
     for (size_t i = 0; i < nConstraints; i++)
     {
         constraints_lowerbound[i] = 0.0;
         constraints_upperbound[i] = 0.0;
     }
-    // Initial state constraints
-    for (size_t j = 0; j < 9; j++)
+
+    // --- Initial state constraints (positions) ---
+    for (size_t j = 0; j < nStates; j++)
     {
         constraints_lowerbound[j] = state[j];
         constraints_upperbound[j] = state[j];
-        vars[j] = state[j];
+        vars[j] = state[j]; // warm-start x0
+    }
+
+    // --- Warm-start: initialize the entire control horizon with last_controls_ ---
+    const size_t control_block_start = nStates * mpc_horizon_;
+    const size_t control_steps = (mpc_horizon_ > 0) ? (mpc_horizon_ - 1) : 0;
+    for (size_t t = 0; t < control_steps; ++t)
+    {
+        for (size_t j = 0; j < nControls; ++j)
+        {
+            size_t idx = control_block_start + t * nControls + j;
+            if (idx < vars.size()) vars[idx] = last_controls_[j];
+        }
     }
 
     // --- Solve ---
@@ -194,6 +216,7 @@ std::tuple<std::vector<std::vector<double>>, std::vector<double>> MPC::solve(con
 
     // --- Trajectory (all joints) ---
     std::vector<std::vector<double>> traj;
+    traj.reserve(mpc_horizon_);
     for (int t = 0; t < mpc_horizon_; t++)
     {
         std::vector<double> joints(9);
@@ -203,10 +226,18 @@ std::tuple<std::vector<std::vector<double>>, std::vector<double>> MPC::solve(con
     }
 
     // --- Controls: first timestep ---
-    std::vector<double> controls(9);
-    for (size_t j = 0; j < 9; j++)
-        controls[j] = solution.x[nStates * mpc_horizon_ + j];
+    std::vector<double> controls(9, 0.0);
+    const size_t first_control_index = nStates * mpc_horizon_;
+    if (first_control_index + 9 <= solution.x.size())
+    {
+        for (size_t j = 0; j < 9; j++)
+            controls[j] = solution.x[first_control_index + j];
+    }
+
+    // --- Save first controls for next warm-start ---
+    last_controls_ = controls;
 
     return {traj, controls};
 }
+
 } // namespace MpcRos

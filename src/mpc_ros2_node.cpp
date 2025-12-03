@@ -1,7 +1,7 @@
 /*
  * MIT License
  * MPCRosNode rewritten to use MoveIt for joint references and MPC as the controller.
- * Author: Adapted for Ronna Medical
+ * Author: Gabriela
  */
 
 #include <rclcpp/rclcpp.hpp>
@@ -22,7 +22,7 @@ using namespace std::chrono_literals;
 namespace MpcRos
 {
 
-class MPCRosNode : public rclcpp::Node
+class MPCRosNode : public rclcpp::Node, public std::enable_shared_from_this<MPCRosNode>
 {
 public:
     MPCRosNode(const std::string & nodeName, const rclcpp::NodeOptions & options);
@@ -55,8 +55,9 @@ private:
     std::string headYawJointName_;
     std::string headPitchJointName_;
 
-    // MPC
-    std::unique_ptr<MPC> _mpc;
+    // MPC and MoveIt
+    moveit::planning_interface::MoveGroupInterface move_group_;
+    std::unique_ptr<MPC> mpc_;
 };
 
 MPCRosNode::MPCRosNode(const std::string & nodeName, const rclcpp::NodeOptions & options)
@@ -84,14 +85,19 @@ MPCRosNode::MPCRosNode(const std::string & nodeName, const rclcpp::NodeOptions &
 
     // Publishers
     pubMpcPath_ = this->create_publisher<nav_msgs::msg::Path>("/mpc_path", 10);
-    pubVacuumCmds_ = this->create_publisher<sensor_msgs::msg::JointState>("/vacuum_cmds", 10);
-    pubRightArmCmds_ = this->create_publisher<sensor_msgs::msg::JointState>("/right_arm_cmds", 10);
+    pubVacuumCmds_ = this->create_publisher<sensor_msgs::msg::JointState>("/vacuum_trajectory_controller/commands", 10);
+    pubRightArmCmds_ = this->create_publisher<sensor_msgs::msg::JointState>("/right_arm_controller/commands", 10);
 
     // Control timer
     controlTimer_ = this->create_wall_timer(100ms, std::bind(&MPCRosNode::calculateControl, this));
 
     // MPC
-    _mpc = std::make_unique<MPC>();
+    mpc_ = std::make_unique<MPC>();
+
+    move_group_ = std::make_unique<moveit::planning_interface::MoveGroupInterface>(
+    this->shared_from_this(), 
+    "right_arm_with_vacuum"
+);
 }
 
 void MPCRosNode::goalCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg)
@@ -122,11 +128,8 @@ void MPCRosNode::calculateControl()
 {
     if (!goal_received_) return;
 
-    auto self = this->shared_from_this();
-    moveit::planning_interface::MoveGroupInterface move_group(self, "vacuum_and_right_arm");
-
     // Get current robot state
-    moveit::core::RobotStatePtr kinematic_state = move_group.getCurrentState();
+    moveit::core::RobotStatePtr kinematic_state = move_group_.getCurrentState();
     const moveit::core::JointModelGroup* joint_group = kinematic_state->getJointModelGroup("vacuum_and_right_arm");
 
     geometry_msgs::msg::PoseStamped goal_pose;
@@ -155,7 +158,7 @@ void MPCRosNode::calculateControl()
 
     // --- Push references into MPC ---
     // Here, order: [vacuum_head_yaw, vacuum_head_pitch, right_shoulder_y, right_shoulder_x, right_shoulder_z, right_elbow_y, right_wrist_z, right_wrist_x, right_wrist_y]
-    _mpc->set_references(
+    mpc_->set_references(
         joint_references[0], // vacuum yaw
         joint_references[1], // vacuum pitch
         joint_references[2], // right_shoulder_y
@@ -178,14 +181,16 @@ void MPCRosNode::calculateControl()
         state[i + 2] = right_arm_pos_[i]; 
 
     // Solve MPC
-    auto [traj, controls] = _mpc->solve(state);
-    if (controls.size() < 9) return;
+    if (traj.size() < 2) return;
+
+    // --- Next predicted positions ---
+    std::vector<double> next_positions = traj[1]; 
 
     // --- Publish vacuum joints ---
     sensor_msgs::msg::JointState vacuum_cmd;
     vacuum_cmd.header.stamp = this->now();
     vacuum_cmd.name = {"vacuum_body_to_stick_root", "vacuum_stick_root_to_head"};
-    vacuum_cmd.position = {controls[0], controls[1]};
+    vacuum_cmd.position = {next_positions[0], next_positions[1]};
     pubVacuumCmds_->publish(vacuum_cmd);
 
     // --- Publish right arm joints ---
@@ -195,7 +200,10 @@ void MPCRosNode::calculateControl()
         "right_shoulder_y", "right_shoulder_x", "right_shoulder_z",
         "right_elbow_y", "right_wrist_z", "right_wrist_x", "right_wrist_y"
     };
-    right_cmd.position = {controls[2], controls[3], controls[4], controls[5], controls[6], controls[7], controls[8]};
+    right_cmd.position = {
+        next_positions[2], next_positions[3], next_positions[4],
+        next_positions[5], next_positions[6], next_positions[7], next_positions[8]
+    };
     pubRightArmCmds_->publish(right_cmd);
 
 }

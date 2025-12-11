@@ -1,83 +1,27 @@
 /*
  * MIT License
- * 
- * Copyright (c) 2024 Mustafa Ege Kural
- * 
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- * 
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- * 
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
- *
-*/
-
-#ifndef MPC_HPP
-#define MPC_HPP
-
-#include <iostream>
-#include <map>
-#include <math.h>
-#include <vector>
-#include <tuple>
-#include <Eigen/Core>
-#include <Eigen/QR>
-#include <cppad/ipopt/solve.hpp>
-
-namespace MpcRos
-{
-template<int nStates, int nControls>
-class MPC
-{
-  public:
-    MPC();
-    MPC(const std::map<std::string, double> &params);
-    std::tuple<std::vector<std::vector<double>>, std::vector<double>> solve(const Eigen::VectorXd& state);
-    void set_references(double j0, double j1, double j2, double j3, double j4,
-                        double j5, double j6, double j7, double j8);
-                        
-  private:
-    int mpc_horizon_;
-    double max_rate_;   
-    double bound_value_;
-    std::vector<double> references_; 
-    std::vector<double> last_controls_;
-
-};
-} // namespace MpcRos
-#endif
-/*
- * MIT License
  * MPCRosNode rewritten to use MoveIt for joint references and MPC as the controller.
  * Author: Gabriela
  * TODO: 
  *  - remove hardcoded number of states and controls
  */
 
-#include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
-#include <sensor_msgs/msg/joint_state.hpp>
+#include <moveit_msgs/msg/display_trajectory.hpp>
+#include <moveit/robot_model_loader/robot_model_loader.h>
+#include <moveit/robot_state/robot_state.h>
+#include <moveit/robot_model/robot_model.h>
 #include <nav_msgs/msg/path.hpp>
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/joint_state.hpp>
 #include <trajectory_msgs/msg/joint_trajectory.hpp>
 
-#include <moveit_msgs/msg/display_trajectory.hpp>
-#include "mpc_ros2/mpc.hpp"
-
 #include <Eigen/Dense>
+#include <map>
 #include <vector>
 #include <thread>
-#include <map>
+
+#include "mpc_ros2/mpc.hpp"
 
 using namespace std::chrono_literals;
 
@@ -125,6 +69,13 @@ private:
     std::shared_ptr<rclcpp::Node> moveit_node_;
     std::shared_ptr<rclcpp::executors::SingleThreadedExecutor> moveit_executor_;
     std::thread moveit_spin_thread_;
+
+    // Forward kinematics
+    geometry_msgs::msg::Pose computeFK(const std::vector<double>& joint_positions);
+    moveit::core::RobotModelPtr moveit_robot_model_;
+    moveit::core::RobotStatePtr moveit_robot_state_;
+    std::string fk_group_name_ = "right_arm_with_vacuum";
+    std::string ee_link_name_ = "vacuum_head";    
 
     // State
     bool joint_state_ready_;
@@ -176,9 +127,26 @@ MPCRosNode::MPCRosNode(const std::string & nodeName, const rclcpp::NodeOptions &
         "moveit_interface_node",
         rclcpp::NodeOptions().append_parameter_override("use_sim_time", true)
     );
+
     moveit_executor_ = std::make_shared<rclcpp::executors::SingleThreadedExecutor>();
     moveit_executor_->add_node(moveit_node_);
     moveit_spin_thread_ = std::thread([this]() { moveit_executor_->spin(); });
+
+    fk_group_name_ = "right_arm_with_vacuum";
+    ee_link_name_ = "vacuum_head";    
+    robot_model_loader::RobotModelLoader robot_model_loader(
+        moveit_node_,
+        "robot_description"
+    );
+    moveit_robot_model_ = robot_model_loader.getModel();
+    if (!moveit_robot_model_)
+    {
+        RCLCPP_ERROR(this->get_logger(), "Failed to load robot model from robot_description!");
+        return;
+    }
+
+    moveit_robot_state_ = std::make_shared<moveit::core::RobotState>(moveit_robot_model_);
+    moveit_robot_state_->setToDefaultValues();
 }
 
 MPCRosNode::~MPCRosNode()
@@ -193,7 +161,6 @@ void MPCRosNode::displayTrajectoryCallback(const moveit_msgs::msg::DisplayTrajec
     if (!msg) return;
     if (msg->trajectory.empty()) return;
 
-    // Take the last trajectory in the DisplayTrajectory array (most recent)
     const auto &robot_traj = msg->trajectory.back();
     const auto &jt = robot_traj.joint_trajectory;
 
@@ -203,7 +170,7 @@ void MPCRosNode::displayTrajectoryCallback(const moveit_msgs::msg::DisplayTrajec
         return;
     }
 
-    // Build expected joint list in the exact ordering we want: [headYaw, headPitch, right_arm(0)...right_arm(7)]
+    // Build expected joint list in the exact ordering:[headYaw, headPitch, right_arm(0)...right_arm(7)]
     std::vector<std::string> expected_joints;
     expected_joints.push_back(headYawJointName_);
     expected_joints.push_back(headPitchJointName_);
@@ -261,6 +228,34 @@ void MPCRosNode::jointStateCallback(const sensor_msgs::msg::JointState::SharedPt
             }
         }
     }
+}
+
+geometry_msgs::msg::Pose MPCRosNode::computeFK(const std::vector<double>& mpc_joint_positions)
+{
+
+    moveit_robot_state_->setJointPositions(headYawJointName_, { mpc_joint_positions[0] });
+    moveit_robot_state_->setJointPositions(headPitchJointName_, { mpc_joint_positions[1] });
+    for (size_t i = 0; i < rightArmJointNames_.size(); ++i)
+    {
+        moveit_robot_state_->setJointPositions(rightArmJointNames_[i], { mpc_joint_positions[2 + i] });
+    }
+
+    moveit_robot_state_->update();
+
+    const Eigen::Isometry3d& ee_tf = moveit_robot_state_->getGlobalLinkTransform(ee_link_name_);
+
+    geometry_msgs::msg::Pose pose;
+    pose.position.x = ee_tf.translation().x();
+    pose.position.y = ee_tf.translation().y();
+    pose.position.z = ee_tf.translation().z();
+
+    Eigen::Quaterniond q(ee_tf.rotation());
+    pose.orientation.x = q.x();
+    pose.orientation.y = q.y();
+    pose.orientation.z = q.z();
+    pose.orientation.w = q.w();
+
+    return pose;
 }
 
 void MPCRosNode::calculateControl()
@@ -325,6 +320,22 @@ void MPCRosNode::calculateControl()
     arm_point.time_from_start = rclcpp::Duration::from_seconds(0.5);
     arm_msg.points.push_back(arm_point);
     pubRightArmCmds_->publish(arm_msg);
+
+    nav_msgs::msg::Path path_msg;
+    path_msg.header.frame_id = "base_link"; 
+    path_msg.header.stamp = this->now();
+
+    for (const auto& joint_positions : traj)
+    {
+        geometry_msgs::msg::PoseStamped pose_stamped;
+        pose_stamped.header.frame_id = "base_link";
+        pose_stamped.header.stamp = this->now();
+
+        pose_stamped.pose = computeFK(joint_positions);
+        path_msg.poses.push_back(pose_stamped);
+    }
+
+    pubMpcPath_->publish(path_msg);
 }
 
 } // namespace MpcRos

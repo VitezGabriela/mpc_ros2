@@ -37,6 +37,7 @@
 
 namespace MpcRos
 {
+template<int nStates, int nControls>
 class MPC
 {
   public:
@@ -45,11 +46,12 @@ class MPC
     std::tuple<std::vector<std::vector<double>>, std::vector<double>> solve(const Eigen::VectorXd& state);
     void set_references(double j0, double j1, double j2, double j3, double j4,
                         double j5, double j6, double j7, double j8);
+                        
   private:
     int mpc_horizon_;
     double max_rate_;   
     double bound_value_;
-    std::vector<double> _references; 
+    std::vector<double> references_; 
     std::vector<double> last_controls_;
 
 };

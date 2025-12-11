@@ -1,7 +1,68 @@
 /*
  * MIT License
+ * 
+ * Copyright (c) 2024 Mustafa Ege Kural
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ *
+*/
+
+#ifndef MPC_HPP
+#define MPC_HPP
+
+#include <iostream>
+#include <map>
+#include <math.h>
+#include <vector>
+#include <tuple>
+#include <Eigen/Core>
+#include <Eigen/QR>
+#include <cppad/ipopt/solve.hpp>
+
+namespace MpcRos
+{
+template<int nStates, int nControls>
+class MPC
+{
+  public:
+    MPC();
+    MPC(const std::map<std::string, double> &params);
+    std::tuple<std::vector<std::vector<double>>, std::vector<double>> solve(const Eigen::VectorXd& state);
+    void set_references(double j0, double j1, double j2, double j3, double j4,
+                        double j5, double j6, double j7, double j8);
+                        
+  private:
+    int mpc_horizon_;
+    double max_rate_;   
+    double bound_value_;
+    std::vector<double> references_; 
+    std::vector<double> last_controls_;
+
+};
+} // namespace MpcRos
+#endif
+/*
+ * MIT License
  * MPCRosNode rewritten to use MoveIt for joint references and MPC as the controller.
  * Author: Gabriela
+ * TODO: 
+ *  - remove hardcoded number of states and controls
  */
 
 #include <rclcpp/rclcpp.hpp>
@@ -51,7 +112,6 @@ private:
     // Stored joint reference for MPC
     Eigen::VectorXd joint_reference_; // size 9
     bool reference_ready_;
-    bool goal_received_;
 
     // Joint names
     std::vector<std::string> rightArmJointNames_;
@@ -59,9 +119,9 @@ private:
     std::string headPitchJointName_;
 
     // MPC
-    std::unique_ptr<MPC> mpc_;
+    std::unique_ptr<MPC<9,9>> mpc_;
 
-    // (We keep moveit node/executor in case other parts rely on MoveIt node)
+    // (Keep for now in case we use move group later)
     std::shared_ptr<rclcpp::Node> moveit_node_;
     std::shared_ptr<rclcpp::executors::SingleThreadedExecutor> moveit_executor_;
     std::thread moveit_spin_thread_;
@@ -75,7 +135,7 @@ MPCRosNode::MPCRosNode(const std::string & nodeName, const rclcpp::NodeOptions &
   right_arm_pos_(Eigen::VectorXd::Zero(7)),
   vacuum_head_yaw_(0.0), vacuum_head_pitch_(0.0),
   joint_reference_(Eigen::VectorXd::Zero(9)),
-  reference_ready_(false), goal_received_(false), joint_state_ready_(false)
+  reference_ready_(false), joint_state_ready_(false)
 {
     // Parameters
     this->declare_parameter<std::string>("vacuum_head_yaw_joint", "vacuum_body_to_stick_root");
@@ -89,19 +149,16 @@ MPCRosNode::MPCRosNode(const std::string & nodeName, const rclcpp::NodeOptions &
     };
 
     // Subscribe to MoveIt's published planned trajectory (RViz shows this after planning)
-    // Use /display_planned_path which is commonly published by MoveIt/rviz in ROS2 setups.
     displayTrajSub_ = this->create_subscription<moveit_msgs::msg::DisplayTrajectory>(
         "/display_planned_path", 10,
         std::bind(&MPCRosNode::displayTrajectoryCallback, this, std::placeholders::_1)
     );
 
-    // Joint states subscription
     jointStatesSub_ = this->create_subscription<sensor_msgs::msg::JointState>(
         "/joint_states", 10,
         std::bind(&MPCRosNode::jointStateCallback, this, std::placeholders::_1)
     );
 
-    // Publishers (unchanged)
     pubMpcPath_ = this->create_publisher<nav_msgs::msg::Path>("/mpc_path", 10);
     pubVacuumCmds_ =
         this->create_publisher<trajectory_msgs::msg::JointTrajectory>(
@@ -110,11 +167,10 @@ MPCRosNode::MPCRosNode(const std::string & nodeName, const rclcpp::NodeOptions &
         this->create_publisher<trajectory_msgs::msg::JointTrajectory>(
             "/right_arm_controller/joint_trajectory", 10);
 
-    // Control timer
     controlTimer_ = this->create_wall_timer(100ms, std::bind(&MPCRosNode::calculateControl, this));
 
     // MPC
-    mpc_ = std::make_unique<MPC>();
+    mpc_ = std::make_unique<MPC<9,9>>();
 
     moveit_node_ = std::make_shared<rclcpp::Node>(
         "moveit_interface_node",
@@ -141,24 +197,26 @@ void MPCRosNode::displayTrajectoryCallback(const moveit_msgs::msg::DisplayTrajec
     const auto &robot_traj = msg->trajectory.back();
     const auto &jt = robot_traj.joint_trajectory;
 
-    if (jt.points.empty()) {
+    if (jt.points.empty()) 
+    {
         RCLCPP_WARN(this->get_logger(), "Received DisplayTrajectory with empty joint_trajectory points; ignoring.");
         return;
     }
 
-    // Build expected joint list in the exact ordering we want: [headYaw, headPitch, right(7)]
+    // Build expected joint list in the exact ordering we want: [headYaw, headPitch, right_arm(0)...right_arm(7)]
     std::vector<std::string> expected_joints;
     expected_joints.push_back(headYawJointName_);
     expected_joints.push_back(headPitchJointName_);
     for (const auto &jn : rightArmJointNames_) expected_joints.push_back(jn);
 
     // Build name -> index map for incoming trajectory joint_names
-    std::map<std::string, size_t> name_to_idx;
-    for (size_t i = 0; i < jt.joint_names.size(); ++i) name_to_idx[jt.joint_names[i]] = i;
+    std::map<std::string, size_t> moveit_joints;
+    for (size_t i = 0; i < jt.joint_names.size(); ++i) moveit_joints[jt.joint_names[i]] = i;
 
-    // Verify that all expected joints are present in the incoming trajectory
+    // Verify that all expected joints are present in the incoming trajectory (TO MAKE SURE RIGHT MOVE GROUP IS USED)
     for (const auto &jn : expected_joints) {
-        if (name_to_idx.find(jn) == name_to_idx.end()) {
+        if (moveit_joints.find(jn) == moveit_joints.end()) 
+        {
             RCLCPP_DEBUG(this->get_logger(),
                          "DisplayTrajectory missing expected joint '%s' — ignoring trajectory.",
                          jn.c_str());
@@ -167,20 +225,20 @@ void MPCRosNode::displayTrajectoryCallback(const moveit_msgs::msg::DisplayTrajec
     }
 
     const auto &last_point = jt.points.back();
-    if (last_point.positions.size() < jt.joint_names.size()) {
+    if (last_point.positions.size() < jt.joint_names.size()) 
+    {
         RCLCPP_WARN(this->get_logger(), "DisplayTrajectory last point positions shorter than joint_names; ignoring.");
         return;
     }
 
-    // Fill joint_reference_ in our expected order using mapping by name
+    // Fill joint_reference_ in  expected order using mapping by name
     for (size_t i = 0; i < expected_joints.size(); ++i) {
         const auto &jn = expected_joints[i];
-        size_t idx = name_to_idx[jn];
+        size_t idx = moveit_joints[jn];
         joint_reference_[i] = last_point.positions[idx];
     }
 
     reference_ready_ = true;
-    goal_received_ = true;
 
     RCLCPP_INFO(this->get_logger(), "Stored MoveIt/RViz planned joint reference for MPC.");
 }
@@ -207,7 +265,7 @@ void MPCRosNode::jointStateCallback(const sensor_msgs::msg::JointState::SharedPt
 
 void MPCRosNode::calculateControl()
 {
-    if (!goal_received_ || !joint_state_ready_ || !reference_ready_)
+    if (!joint_state_ready_ || !reference_ready_)
         return;
 
     // Set references to MPC
@@ -232,9 +290,9 @@ void MPCRosNode::calculateControl()
                 joint_reference_[6], joint_reference_[7], joint_reference_[8]);
 
     double joint_error = (state - joint_reference_).norm() / std::sqrt(state.size());
-    if (joint_error < 0.005) {  // 0.02 rad per joint on average
+    if (joint_error < 0.005) 
+    {
         RCLCPP_INFO(this->get_logger(), "Goal REACHED");
-        goal_received_ = false;
         reference_ready_ = false;
         return;
     }

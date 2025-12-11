@@ -75,7 +75,7 @@ private:
     moveit::core::RobotModelPtr moveit_robot_model_;
     moveit::core::RobotStatePtr moveit_robot_state_;
     std::string fk_group_name_ = "right_arm_with_vacuum";
-    std::string ee_link_name_ = "vacuum_head";    
+    std::string ee_link_name_ = "vacuum_tip";    
 
     // State
     bool joint_state_ready_;
